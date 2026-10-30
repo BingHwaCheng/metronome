@@ -1,0 +1,173 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Metronome</title>
+</head>
+<body>
+<p id="status">Metronome: stopped, 120 BPM</p>
+<script>
+'use strict';
+
+// Displayless metronome. Captouch input arrives as document CustomEvents from the
+// web app host: captouch:tap (start/stop), captouch:doubletap (+5 BPM),
+// captouch:tripletap (-5 BPM).
+
+const DEFAULT_BPM = 120;
+const BPM_STEP = 5;
+const MIN_BPM = 40;
+const MAX_BPM = 240;
+const BEATS_PER_BAR = 4;
+const ACCENT_HZ = 1568; // G6, first beat of the bar
+const BEAT_HZ = 1047; // C6, remaining beats
+const BEEP_SECONDS = 0.06;
+const SCHEDULE_AHEAD_SECONDS = 0.12;
+const SCHEDULER_INTERVAL_MS = 25;
+// Start the beat even if the TTS engine never reports the end of the announcement.
+const SPEECH_FALLBACK_MS = 4000;
+
+const statusEl = document.getElementById('status');
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+let bpm = DEFAULT_BPM;
+let running = false;
+let pendingStart = false;
+let beatIndex = 0;
+let nextBeatTime = 0;
+let schedulerTimer = null;
+let speechFallbackTimer = null;
+
+function log(message) {
+  console.log('METRONOME ' + message);
+}
+
+function render() {
+  statusEl.textContent =
+      'Metronome: ' + (running ? 'running' : pendingStart ? 'starting' : 'stopped') +
+      ', ' + bpm + ' BPM';
+}
+
+function speak(text, onDone) {
+  if (!('speechSynthesis' in window)) {
+    log('speechSynthesis unavailable');
+    if (onDone) onDone();
+    return;
+  }
+  speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(speechFallbackTimer);
+    if (onDone) onDone();
+  };
+  utterance.onend = finish;
+  utterance.onerror = (e) => {
+    log('speech error: ' + e.error);
+    finish();
+  };
+  if (onDone) {
+    clearTimeout(speechFallbackTimer);
+    speechFallbackTimer = setTimeout(() => {
+      log('speech end not reported; starting anyway');
+      finish();
+    }, SPEECH_FALLBACK_MS);
+  }
+  speechSynthesis.speak(utterance);
+}
+
+function scheduleBeep(time, accent) {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = accent ? ACCENT_HZ : BEAT_HZ;
+  gain.gain.setValueAtTime(0.0001, time);
+  gain.gain.exponentialRampToValueAtTime(accent ? 0.9 : 0.6, time + 0.003);
+  gain.gain.exponentialRampToValueAtTime(0.0001, time + BEEP_SECONDS);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(time);
+  osc.stop(time + BEEP_SECONDS + 0.01);
+}
+
+function scheduler() {
+  while (nextBeatTime < audioCtx.currentTime + SCHEDULE_AHEAD_SECONDS) {
+    scheduleBeep(nextBeatTime, beatIndex === 0);
+    beatIndex = (beatIndex + 1) % BEATS_PER_BAR;
+    // Reads the live bpm, so tempo changes apply from the next beat.
+    nextBeatTime += 60 / bpm;
+  }
+}
+
+function beginBeats() {
+  if (!pendingStart) return; // Stopped while the announcement was playing.
+  pendingStart = false;
+  running = true;
+  beatIndex = 0;
+  nextBeatTime = audioCtx.currentTime + 0.05;
+  scheduler();
+  schedulerTimer = setInterval(scheduler, SCHEDULER_INTERVAL_MS);
+  log('started at ' + bpm + ' BPM');
+  render();
+}
+
+function start() {
+  pendingStart = true;
+  audioCtx.resume().then(() => log('audio context ' + audioCtx.state));
+  render();
+  speak(bpm + ' beats per minute', beginBeats);
+}
+
+function stop() {
+  pendingStart = false;
+  running = false;
+  clearInterval(schedulerTimer);
+  clearTimeout(speechFallbackTimer);
+  schedulerTimer = null;
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  log('stopped');
+  render();
+}
+
+function changeBpm(delta) {
+  const next = Math.min(MAX_BPM, Math.max(MIN_BPM, bpm + delta));
+  if (next === bpm) {
+    speak(bpm === MAX_BPM ? 'Maximum ' + bpm : 'Minimum ' + bpm);
+    return;
+  }
+  bpm = next;
+  log('bpm ' + bpm);
+  render();
+  // While starting, the pending announcement would state the old tempo; restart it.
+  if (pendingStart) {
+    speak(bpm + ' beats per minute', beginBeats);
+  } else {
+    speak(String(bpm));
+  }
+}
+
+document.addEventListener('captouch:tap', () => {
+  log('tap');
+  if (running || pendingStart) {
+    stop();
+  } else {
+    start();
+  }
+});
+document.addEventListener('captouch:doubletap', () => {
+  log('doubletap');
+  changeBpm(BPM_STEP);
+});
+document.addEventListener('captouch:tripletap', () => {
+  log('tripletap');
+  changeBpm(-BPM_STEP);
+});
+
+log('ready, audio context ' + audioCtx.state);
+render();
+</script>
+</body>
+</html>
